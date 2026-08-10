@@ -1,0 +1,109 @@
+# Publishes, per ticker, which tracked well-known investors currently hold
+# it — sourced from SEC 13F-HR filings (free, quarterly, filed ~45 days
+# after quarter-end). See scripts/generateSmartMoneyHoldings.js for the
+# full rationale and design.
+#
+# Weekly, not daily — 13F holdings only change once a quarter, and running
+# more often than that just spends the ~2600ms-per-batch OpenFIGI mapping
+# budget (7000+ CUSIPs across the current roster, ~30+ minutes) for no new
+# information. Scheduled at 20:00 UTC Sundays, clear of every other job
+# writing to the same Gist (00:00 main pipeline, ~12:00 P/FCF cache, 14:00
+# foreign filings, 17:00 foreign P/FCF cache, 18:00 insider activity).
+#
+# One-time setup required (this workflow can't do these for you):
+#   1. Add a repository secret named GIST_ID — the SAME Gist ID the other
+#      pipelines already publish to.
+#   2. Add a repository secret named GIST_TOKEN — the SAME kind of
+#      Personal Access Token the other pipelines use (CLASSIC type, scoped
+#      to ONLY "gist").
+# No Finnhub/Twelve Data/FMP key needed — this pipeline only calls SEC's
+# free, keyless EDGAR API and OpenFIGI's free, keyless mapping API.
+
+name: Generate smart money holdings
+
+on:
+  schedule:
+    - cron: '0 20 * * 0'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate smart money holdings
+        run: node scripts/generateSmartMoneyHoldings.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename smartMoneyHoldings.json smartMoneyHoldings.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add smartMoneyHoldings.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Smart money holdings pipeline failed',
+                body: `The weekly generation run failed.\n\nRun: ${runUrl}\n\nCheck the GIST_TOKEN and GIST_ID secrets, SEC EDGAR's API status, and OpenFIGI's API status.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

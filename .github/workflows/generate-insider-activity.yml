@@ -1,0 +1,111 @@
+# Publishes recent (~30 day) insider Form 4 open-market buy/sell activity,
+# across the FULL covered universe. See scripts/generateInsiderActivity.js
+# for the full rationale and design.
+#
+# Daily — SEC requires Form 4 filing within 2 business days of a
+# transaction, and the published "last 30 days" window is time-sensitive.
+# Scheduled at 18:00 UTC, clear of every other job writing to the same
+# Gist (00:00 main pipeline, ~12:00 P/FCF cache, 14:00 foreign filings,
+# 17:00 foreign P/FCF cache, 20:00 Sundays smart money holdings).
+#
+# Comparable in scope to stock-metrics-pipeline's own main daily job (a
+# full-universe crawl, not a narrow gap-ticker sweep) — timeout set
+# generously to match.
+#
+# One-time setup required (this workflow can't do these for you):
+#   1. Add a repository secret named GIST_ID — the SAME Gist ID the other
+#      pipelines already publish to.
+#   2. Add a repository secret named GIST_TOKEN — the SAME kind of
+#      Personal Access Token the other pipelines use (CLASSIC type, scoped
+#      to ONLY "gist").
+# No Finnhub/Twelve Data/FMP key needed — this pipeline only calls SEC's
+# free, keyless EDGAR API.
+
+name: Generate insider activity
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate insider activity cache
+        run: node scripts/generateInsiderActivity.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename insiderActivityCache.json insiderActivityCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add insiderActivityCache.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Insider activity pipeline failed',
+                body: `The daily generation run failed.\n\nRun: ${runUrl}\n\nCheck the GIST_TOKEN and GIST_ID secrets, and SEC EDGAR's API status.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

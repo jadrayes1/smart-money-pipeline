@@ -1,0 +1,13 @@
+{
+  "name": "smart-money-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Publishes 13F institutional-holder and Form 4 insider-activity data per ticker, for stock-analyzer",
+  "scripts": {
+    "holdings": "node scripts/generateSmartMoneyHoldings.js",
+    "insider-activity": "node scripts/generateInsiderActivity.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
