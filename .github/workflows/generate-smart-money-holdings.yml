@@ -44,12 +44,27 @@ jobs:
       - name: Generate smart money holdings
         run: node scripts/generateSmartMoneyHoldings.js
 
+      # Git-clone-based publish, not `gh gist edit` — the output file is
+      # ~3MB with the full 23-fund roster, over the Gist API's 1MB-per-file
+      # publish limit. Same pattern already used by stock-metrics-pipeline's
+      # own oversized files (marketMetrics.json etc.) for the same reason.
       - name: Publish to gist
         env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename smartMoneyHoldings.json smartMoneyHoldings.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add smartMoneyHoldings.json
+          git clone "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
+          cp smartMoneyHoldings.json gist-clone/smartMoneyHoldings.json
+          cd gist-clone
+          git config user.email "actions@github.com"
+          git config user.name "smart-money-pipeline"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git commit -m "Update smart money holdings $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
 
       - name: Report failure
         if: failure()
