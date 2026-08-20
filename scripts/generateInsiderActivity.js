@@ -19,8 +19,8 @@ const path = require('path');
 const { sleep, fetchJson, fetchText, fetchTickerToCikMap, fetchSubmissions } = require('./lib/secEdgar');
 
 const OUTPUT_FILE = path.join(__dirname, '../insiderActivityCache.json');
-const GIST_ACTIVITY_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/insiderActivityCache.json';
-const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
+const GIST_ACTIVITY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/insiderActivityCache.json';
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 const SEC_SPACING_MS = 150;
 const LOOKBACK_DAYS = 35; // a few days of slack past the 30-day window SEC requires Form 4 filing within
 const RETENTION_DAYS = 30; // published window shown to users

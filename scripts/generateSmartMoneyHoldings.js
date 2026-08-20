@@ -25,8 +25,8 @@ const path = require('path');
 const { sleep, fetchJson, fetchText, fetchSubmissions, fetchWithTimeout } = require('./lib/secEdgar');
 
 const OUTPUT_FILE = path.join(__dirname, '../smartMoneyHoldings.json');
-const GIST_HOLDINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/smartMoneyHoldings.json';
-const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
+const GIST_HOLDINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/smartMoneyHoldings.json';
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 const OPENFIGI_URL = 'https://api.openfigi.com/v3/mapping';
 const OPENFIGI_BATCH_SIZE = 10; // unauthenticated cap
 const OPENFIGI_SPACING_MS = 2600; // keeps well under 25 req/min unauthenticated
