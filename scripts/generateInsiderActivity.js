@@ -37,6 +37,32 @@ function daysAgo(days) {
   return d;
 }
 
+// What fraction of the insider's PRE-transaction stake this transaction
+// represents — the size signal a raw share count or dollar value can't
+// convey on its own (a 50,000-share sale means something very different
+// for an insider who held 60,000 shares vs. one who held 6 million).
+// sharesOwnedFollowingTransaction (the only post-transaction balance Form
+// 4 discloses) plus the transaction's own share count is enough to derive
+// the pre-transaction balance without needing any other filing: for a sale
+// sharesBefore = sharesAfter + sharesTransacted (shares existed before,
+// some were removed); for a purchase sharesBefore = sharesAfter -
+// sharesTransacted (shares were added on top of whatever existed).
+// A purchase with zero pre-transaction shares is a brand-new position
+// (percent-of-prior-stake is undefined, not 0% or infinite) — flagged via
+// isNewPosition rather than forced into a misleading percentage. Returns
+// nulls (never NaN/Infinity) whenever sharesOwnedAfter is missing (a real,
+// fairly common regex miss — see sharesOwnedAfter's own comment) or the
+// derived pre-transaction balance is negative (a data anomaly, not a real
+// stake) — the app's job is to render "no size context available" for
+// these, not a garbage number.
+function computeStakeSignificance(sharesTransacted, sharesOwnedAfter, acquiredDisposed) {
+  if (sharesOwnedAfter == null || !Number.isFinite(sharesOwnedAfter)) return { stakePercent: null, isNewPosition: false };
+  const sharesBefore = acquiredDisposed === 'A' ? sharesOwnedAfter - sharesTransacted : sharesOwnedAfter + sharesTransacted;
+  if (sharesBefore < 0) return { stakePercent: null, isNewPosition: false };
+  if (sharesBefore === 0) return { stakePercent: null, isNewPosition: acquiredDisposed === 'A' };
+  return { stakePercent: sharesTransacted / sharesBefore, isNewPosition: false };
+}
+
 // Form 4 XML is simple, flat, repeating structure like the 13F info table
 // — same lightweight regex-extraction approach as generateSmartMoneyHoldings.js,
 // verified live against a real current Apple Form 4 before writing this.
@@ -64,13 +90,17 @@ function parseForm4(xml) {
     const sharesOwnedAfter = parseFloat(block.match(/<sharesOwnedFollowingTransaction>\s*<value>([^<]+)<\/value>/i)?.[1] || 'NaN');
     if (!transactionDate || !transactionCode || Number.isNaN(shares)) continue;
     if (!SIGNAL_CODES.has(transactionCode)) continue;
+    const ownedAfter = Number.isNaN(sharesOwnedAfter) ? null : sharesOwnedAfter;
+    const { stakePercent, isNewPosition } = computeStakeSignificance(shares, ownedAfter, acquiredDisposed);
     transactions.push({
       transactionDate,
       transactionCode,
       sharesTransacted: shares,
       pricePerShare: price,
       acquiredDisposed: acquiredDisposed || null,
-      sharesOwnedAfter: Number.isNaN(sharesOwnedAfter) ? null : sharesOwnedAfter,
+      sharesOwnedAfter: ownedAfter,
+      stakePercent,
+      isNewPosition,
     });
   }
   if (!transactions.length) return null;
@@ -85,14 +115,30 @@ async function fetchRecentForm4Filings(cik, sinceDate) {
   for (let i = 0; i < r.form.length; i++) {
     if (r.form[i] !== '4') continue;
     if (new Date(r.filingDate[i]) < sinceDate) break; // recent[] is filing-date descending — safe to stop early
-    filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
+    filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i], primaryDocument: r.primaryDocument[i] });
   }
   return filings;
 }
 
-function form4XmlUrl(cik, accessionNumber) {
+// The primary document's FILENAME (not its full path -- see below) varies
+// per filer depending on whatever filing-agent software they use --
+// verified live: AAPL uses "form4.xml", NVDA/AMZN use Workiva's
+// "wk-form4_<id>.xml", GOOGL uses "ownership.xml". A hardcoded "form4.xml"
+// 404s for every filer that isn't AAPL's exact convention, and that 404
+// was being silently swallowed (fetchText returns null on 404, the caller
+// just `continue`s) -- so a large fraction of the covered universe never
+// even got a chance to surface real insider activity that existed.
+//
+// submissions.json's own `primaryDocument` field (e.g.
+// "xslF345X06/wk-form4_1787607122.xml") gives the right FILENAME, but its
+// directory prefix ("xslF345X06/") points at the human-readable XSLT-
+// rendered HTML view, not the raw XML this file's regex parser needs --
+// verified live both ways. The raw XML lives at the same accession folder
+// using just the basename, with no subdirectory.
+function form4XmlUrl(cik, accessionNumber, primaryDocument) {
   const accessionNoDashes = accessionNumber.replace(/-/g, '');
-  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accessionNoDashes}/form4.xml`;
+  const filename = primaryDocument ? primaryDocument.split('/').pop() : 'form4.xml';
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accessionNoDashes}/${filename}`;
 }
 
 // Union fresh entries with still-within-RETENTION_DAYS previously-published
@@ -146,9 +192,13 @@ async function main() {
 
       const transactions = [];
       for (const filing of filings) {
-        const xml = await fetchText(form4XmlUrl(cik, filing.accessionNumber));
+        const url = form4XmlUrl(cik, filing.accessionNumber, filing.primaryDocument);
+        const xml = await fetchText(url);
         await sleep(SEC_SPACING_MS);
-        if (!xml) continue;
+        if (!xml) {
+          console.log(`  ${ticker}: 404/empty fetching ${url}`);
+          continue;
+        }
         const parsed = parseForm4(xml);
         if (!parsed) continue;
         for (const t of parsed.transactions) {
@@ -186,7 +236,7 @@ async function main() {
   console.log(`Done. ${Object.keys(merged).length} tickers have recent signal insider activity.`);
 }
 
-module.exports = { parseForm4, mergeTransactions, SIGNAL_CODES };
+module.exports = { parseForm4, mergeTransactions, SIGNAL_CODES, computeStakeSignificance, form4XmlUrl };
 
 if (require.main === module) {
   main().catch((err) => {
