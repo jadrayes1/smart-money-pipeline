@@ -30,6 +30,17 @@ permissions:
   contents: read
   issues: write
 
+# Shares a concurrency group with every other gist-publisher in this repo --
+# see stock-metrics-pipeline's generate-sector-metrics.yml for the full
+# root-cause history. This group is just an optimization against same-repo
+# contention; the git-clone + force-with-lease + retry pattern below (an
+# upgrade from this workflow's own prior bare, non-retrying `git push`,
+# which would have failed the whole job outright on any real contention
+# instead of self-healing) is the actual cross-repo-safe mechanism.
+concurrency:
+  group: smart-money-gist-publish
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -53,18 +64,34 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          git clone "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
-          cp smartMoneyHoldings.json gist-clone/smartMoneyHoldings.json
-          cd gist-clone
-          git config user.email "actions@github.com"
-          git config user.name "smart-money-pipeline"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to publish."
-          else
-            git commit -m "Update smart money holdings $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
-          fi
+          set -e
+          CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
+          attempt=1
+          while true; do
+            rm -rf gist-clone
+            git clone --depth 1 "$CLONE_URL" gist-clone
+            if diff -q smartMoneyHoldings.json gist-clone/smartMoneyHoldings.json >/dev/null 2>&1; then
+              echo "No changes to publish."
+              break
+            fi
+            EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+            cp smartMoneyHoldings.json gist-clone/smartMoneyHoldings.json
+            ( cd gist-clone
+              git config user.email "actions@github.com"
+              git config user.name "smart-money-pipeline"
+              git checkout --orphan latest-snapshot
+              git add -A
+              git commit -m "Update smart money holdings $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git branch -M main
+              git push --force-with-lease="main:${EXPECTED_SHA}" origin main
+            ) && { echo "Published on attempt $attempt."; break; }
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 5 ]; then
+              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              exit 1
+            fi
+            echo "Push rejected (remote moved since clone) — retrying (attempt ${attempt}/5)..."
+          done
 
       - name: Report failure
         if: failure()
