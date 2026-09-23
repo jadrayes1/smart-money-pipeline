@@ -47,20 +47,96 @@ function daysAgo(days) {
 // sharesBefore = sharesAfter + sharesTransacted (shares existed before,
 // some were removed); for a purchase sharesBefore = sharesAfter -
 // sharesTransacted (shares were added on top of whatever existed).
-// A purchase with zero pre-transaction shares is a brand-new position
-// (percent-of-prior-stake is undefined, not 0% or infinite) — flagged via
-// isNewPosition rather than forced into a misleading percentage. Returns
-// nulls (never NaN/Infinity) whenever sharesOwnedAfter is missing (a real,
-// fairly common regex miss — see sharesOwnedAfter's own comment) or the
-// derived pre-transaction balance is negative (a data anomaly, not a real
-// stake) — the app's job is to render "no size context available" for
-// these, not a garbage number.
-function computeStakeSignificance(sharesTransacted, sharesOwnedAfter, acquiredDisposed) {
+//
+// otherHoldingsShares (new) accounts for shares of the SAME security held
+// in OTHER ownership vehicles this specific transaction row doesn't touch
+// -- see resolveOwnershipBuckets below. Without it, an insider whose stock
+// is split across direct + indirect (trust, spouse, an LLC) ownership gets
+// a wildly inflated percentage whenever a transaction only touches ONE of
+// those vehicles. Verified live: META's Andrew Bosworth sold 7,848 shares
+// leaving 828 direct -- computed as 90% of "stake" using only that direct
+// balance, when his real total (828 direct + 69,170 via a living trust
+// disclosed in the SAME filing) makes it ~10%. Also verified for CoreWeave's
+// Michael Intrator: a Form 4 converting-then-fully-selling 107,692 shares
+// through a side LLC ("Omnadora Capital") computed as a 100% "full exit"
+// using only that LLC's own balance, when his real direct holdings
+// (1,287,129 shares, untouched, same filing) make it under 0.3%.
+//
+// A purchase with zero pre-transaction shares ACROSS EVERY vehicle is a
+// brand-new position (percent-of-prior-stake is undefined, not 0% or
+// infinite) — flagged via isNewPosition rather than forced into a
+// misleading percentage. Returns nulls (never NaN/Infinity) whenever
+// sharesOwnedAfter is missing (a real, fairly common regex miss — see
+// sharesOwnedAfter's own comment) or the derived pre-transaction balance
+// is negative (a data anomaly, not a real stake) — the app's job is to
+// render "no size context available" for these, not a garbage number.
+function computeStakeSignificance(sharesTransacted, sharesOwnedAfter, acquiredDisposed, otherHoldingsShares = 0) {
   if (sharesOwnedAfter == null || !Number.isFinite(sharesOwnedAfter)) return { stakePercent: null, isNewPosition: false };
-  const sharesBefore = acquiredDisposed === 'A' ? sharesOwnedAfter - sharesTransacted : sharesOwnedAfter + sharesTransacted;
-  if (sharesBefore < 0) return { stakePercent: null, isNewPosition: false };
-  if (sharesBefore === 0) return { stakePercent: null, isNewPosition: acquiredDisposed === 'A' };
-  return { stakePercent: sharesTransacted / sharesBefore, isNewPosition: false };
+  const sharesBeforeInBucket = acquiredDisposed === 'A' ? sharesOwnedAfter - sharesTransacted : sharesOwnedAfter + sharesTransacted;
+  if (sharesBeforeInBucket < 0) return { stakePercent: null, isNewPosition: false };
+  const totalSharesBefore = sharesBeforeInBucket + Math.max(otherHoldingsShares, 0);
+  if (totalSharesBefore === 0) return { stakePercent: null, isNewPosition: acquiredDisposed === 'A' };
+  return { stakePercent: sharesTransacted / totalSharesBefore, isNewPosition: false };
+}
+
+// Form 4 Table I can report the SAME security across several distinct
+// "ownership vehicles" in one filing -- direct, or indirect via a trust /
+// spouse / LLC (each disclosed with its own directOrIndirectOwnership +
+// natureOfOwnership and its OWN running sharesOwnedFollowingTransaction
+// balance) -- via a mix of <nonDerivativeTransaction> rows (a vehicle that
+// transacted today) and <nonDerivativeHolding> rows (a vehicle disclosed
+// as unchanged). Bucketing by (securityTitle, directOrIndirect,
+// natureOfOwnership) and keeping only the LAST balance seen per bucket
+// (multiple same-day transaction rows for ONE vehicle are already a
+// running total -- see MU's 27-row same-day example in
+// stock-analyzer/src/components/InsiderActivity.js) gives each vehicle's
+// true current balance without double-counting.
+function ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership) {
+  return `${securityTitle || ''}|${directOrIndirect || ''}|${directOrIndirect === 'I' ? natureOfOwnership || '' : ''}`;
+}
+
+function extractBlockFields(block) {
+  const securityTitle = block.match(/<securityTitle>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || null;
+  const directOrIndirect = block.match(/<directOrIndirectOwnership>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || null;
+  const natureOfOwnership = block.match(/<natureOfOwnership>\s*<value>([^<]*)<\/value>/i)?.[1]?.trim() || null;
+  const sharesOwnedAfter = parseFloat(block.match(/<sharesOwnedFollowingTransaction>\s*<value>([^<]+)<\/value>/i)?.[1] || 'NaN');
+  return { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter: Number.isNaN(sharesOwnedAfter) ? null : sharesOwnedAfter };
+}
+
+// Returns { bucketFinalBalance: Map<bucketKey, number>, totalBySecurity: Map<securityTitle, number> }
+// scanning every nonDerivativeTransaction + nonDerivativeHolding block in
+// the filing, in document order (transaction rows for the same bucket
+// naturally overwrite earlier ones as later, more-current balances).
+function resolveOwnershipBuckets(transactionBlocks, holdingBlocks) {
+  const bucketFinalBalance = new Map();
+  const bucketSecurity = new Map();
+
+  for (const block of transactionBlocks) {
+    const { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter } = extractBlockFields(block);
+    if (sharesOwnedAfter == null) continue;
+    const key = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
+    bucketFinalBalance.set(key, sharesOwnedAfter);
+    bucketSecurity.set(key, securityTitle);
+  }
+  // A holding row exists specifically to disclose a vehicle NOT touched by
+  // any transaction today, so it should never override a transaction row's
+  // balance for the same bucket -- only fill in buckets transactions didn't
+  // already cover.
+  for (const block of holdingBlocks) {
+    const { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter } = extractBlockFields(block);
+    if (sharesOwnedAfter == null) continue;
+    const key = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
+    if (bucketFinalBalance.has(key)) continue;
+    bucketFinalBalance.set(key, sharesOwnedAfter);
+    bucketSecurity.set(key, securityTitle);
+  }
+
+  const totalBySecurity = new Map();
+  for (const [key, balance] of bucketFinalBalance) {
+    const sec = bucketSecurity.get(key);
+    totalBySecurity.set(sec, (totalBySecurity.get(sec) || 0) + balance);
+  }
+  return { bucketFinalBalance, totalBySecurity };
 }
 
 // Form 4 XML is simple, flat, repeating structure like the 13F info table
@@ -76,6 +152,8 @@ function parseForm4(xml) {
 
   const transactions = [];
   const blocks = xml.match(/<nonDerivativeTransaction>[\s\S]*?<\/nonDerivativeTransaction>/gi) || [];
+  const holdingBlocks = xml.match(/<nonDerivativeHolding>[\s\S]*?<\/nonDerivativeHolding>/gi) || [];
+  const { bucketFinalBalance, totalBySecurity } = resolveOwnershipBuckets(blocks, holdingBlocks);
   for (const block of blocks) {
     const transactionDate = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
     const transactionCode = block.match(/<transactionCode>([^<]+)<\/transactionCode>/i)?.[1]?.trim();
@@ -91,7 +169,11 @@ function parseForm4(xml) {
     if (!transactionDate || !transactionCode || Number.isNaN(shares)) continue;
     if (!SIGNAL_CODES.has(transactionCode)) continue;
     const ownedAfter = Number.isNaN(sharesOwnedAfter) ? null : sharesOwnedAfter;
-    const { stakePercent, isNewPosition } = computeStakeSignificance(shares, ownedAfter, acquiredDisposed);
+    const { securityTitle, directOrIndirect, natureOfOwnership } = extractBlockFields(block);
+    const bucketKey = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
+    const thisBucketFinalBalance = bucketFinalBalance.get(bucketKey) ?? ownedAfter ?? 0;
+    const otherHoldingsShares = (totalBySecurity.get(securityTitle) || 0) - thisBucketFinalBalance;
+    const { stakePercent, isNewPosition } = computeStakeSignificance(shares, ownedAfter, acquiredDisposed, otherHoldingsShares);
     transactions.push({
       transactionDate,
       transactionCode,
