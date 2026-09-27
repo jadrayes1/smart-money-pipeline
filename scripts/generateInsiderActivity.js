@@ -139,12 +139,42 @@ function resolveOwnershipBuckets(transactionBlocks, holdingBlocks) {
   return { bucketFinalBalance, totalBySecurity };
 }
 
+// Real SEC Form 4 filings mix casing for the exact same field across
+// different filers/filing agents -- verified live: "HOLTUG LARS" and
+// "Imperiale Richard P" side by side in the same dataset, same field,
+// same real-world meaning (just inconsistent submission style). Only
+// touches a name that's ENTIRELY uppercase (a confident signal the casing
+// itself carries no real information) -- any name with even one lowercase
+// letter is left completely alone, since several real names rely on
+// intentional internal capitalization a blanket lowercase-then-titlecase
+// pass would destroy (e.g. "AlTi Global, Inc.", a real stylized brand name
+// with a capital T mid-word; "Chang Hung-Lun (Fred)"). Roman numerals
+// (II/III/...) and common entity suffixes (LLC/INC/CORP/...) are kept
+// fully uppercase rather than naively title-cased to "Iii"/"Llc" -- JR/SR
+// deliberately excluded from that list since "Jr"/"Sr" (not "JR"/"SR") is
+// the standard convention once actually normalized.
+const KEEP_UPPERCASE_WORD = /^(I|II|III|IV|V|VI|VII|VIII|IX|X|LLC|LLP|LP|INC|CORP|CO|LTD|PLC|NA|UG)\.?,?$/i;
+
+function titleCaseWord(word) {
+  const lower = word.toLowerCase();
+  return lower.replace(/(^|[-'])([a-z])/g, (m, sep, ch) => sep + ch.toUpperCase());
+}
+
+function normalizeInsiderName(name) {
+  if (!name) return name;
+  if (/[a-z]/.test(name)) return name;
+  return name
+    .split(' ')
+    .map((word) => (KEEP_UPPERCASE_WORD.test(word) ? word : titleCaseWord(word)))
+    .join(' ');
+}
+
 // Form 4 XML is simple, flat, repeating structure like the 13F info table
 // — same lightweight regex-extraction approach as generateSmartMoneyHoldings.js,
 // verified live against a real current Apple Form 4 before writing this.
 function parseForm4(xml) {
   const issuerTicker = xml.match(/<issuerTradingSymbol>([^<]*)<\/issuerTradingSymbol>/i)?.[1]?.trim();
-  const ownerName = xml.match(/<rptOwnerName>([^<]*)<\/rptOwnerName>/i)?.[1]?.trim();
+  const ownerName = normalizeInsiderName(xml.match(/<rptOwnerName>([^<]*)<\/rptOwnerName>/i)?.[1]?.trim());
   const isOfficer = /<isOfficer>\s*1|true\s*<\/isOfficer>/i.test(xml);
   const isDirector = /<isDirector>\s*1|true\s*<\/isDirector>/i.test(xml);
   const isTenPercentOwner = /<isTenPercentOwner>\s*1|true\s*<\/isTenPercentOwner>/i.test(xml);
@@ -318,7 +348,7 @@ async function main() {
   console.log(`Done. ${Object.keys(merged).length} tickers have recent signal insider activity.`);
 }
 
-module.exports = { parseForm4, mergeTransactions, SIGNAL_CODES, computeStakeSignificance, form4XmlUrl };
+module.exports = { parseForm4, mergeTransactions, SIGNAL_CODES, computeStakeSignificance, form4XmlUrl, normalizeInsiderName };
 
 if (require.main === module) {
   main().catch((err) => {
