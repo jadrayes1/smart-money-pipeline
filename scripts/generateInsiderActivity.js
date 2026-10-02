@@ -211,6 +211,25 @@ function parseForm4(xml) {
       pricePerShare: price,
       acquiredDisposed: acquiredDisposed || null,
       sharesOwnedAfter: ownedAfter,
+      // Identifies WHICH ownership vehicle this row belongs to (direct, or
+      // the specific trust/spouse/LLC named in natureOfOwnership) -- see
+      // ownershipBucketKey's own comment. Lets the app's own same-day
+      // grouping (groupSameDayTransactions in InsiderActivity.js) collapse
+      // only genuinely-repeated executions of ONE vehicle's single sale
+      // (SEC's own per-price-tick rows), not merge together entirely
+      // different vehicles the way it previously did by insiderName+date+
+      // code alone. Verified live: Mark Zuckerberg's real 2026-09-28 Form 4
+      // has 5 executions fully liquidating "CZI Holdings, LLC" (17,140 -> 0,
+      // a real full exit for THAT vehicle) interleaved with 5 separate,
+      // much smaller executions against "Chan Zuckerberg Biohub, Inc."
+      // (which still holds 1,220,703 shares after) -- grouping both
+      // together previously took the group's MINIMUM post-transaction
+      // balance across all 10 rows (0, from the liquidated LLC) and
+      // displayed it as if it were Zuckerberg's own overall "Full exit",
+      // when his real aggregate position (let alone his much larger direct/
+      // Class B holdings, untouched by this filing) is still over a million
+      // shares.
+      ownershipBucket: bucketKey,
       stakePercent,
       isNewPosition,
     });
