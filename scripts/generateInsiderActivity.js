@@ -230,6 +230,17 @@ function parseForm4(xml) {
       // Class B holdings, untouched by this filing) is still over a million
       // shares.
       ownershipBucket: bucketKey,
+      // Human-readable counterpart to ownershipBucket, for DISPLAY -- the
+      // bucket key itself is a machine grouping key, not UI text. null for
+      // a direct holding (directOrIndirect === 'D', already fully
+      // identified by the insider's own name -- no separate entity to
+      // name). Real natureOfOwnership text is inconsistently phrased across
+      // filers -- verified live, same Form 4, same filer: "By CZI Holdings,
+      // LLC" / "By Chan Zuckerberg Biohub, Inc." (both "By "-prefixed) vs.
+      // "Christopher K. Cox Revocable Trust" (not prefixed at all) -- the
+      // leading "By " is stripped here so the app can apply ONE consistent
+      // "via <name>" convention without ever doubling up as "via By X".
+      ownershipLabel: directOrIndirect === 'I' && natureOfOwnership ? natureOfOwnership.replace(/^by\s+/i, '') : null,
       stakePercent,
       isNewPosition,
     });
