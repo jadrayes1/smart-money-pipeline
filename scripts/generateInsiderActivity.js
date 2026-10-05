@@ -230,6 +230,20 @@ function parseForm4(xml) {
       // Class B holdings, untouched by this filing) is still over a million
       // shares.
       ownershipBucket: bucketKey,
+      // The insider's TRUE aggregate remaining position in this security --
+      // summed across EVERY ownership vehicle this filing discloses (direct
+      // + every distinct trust/spouse/LLC), not just this one row's own
+      // bucket. "Full exit" (InsiderActivity.js's significanceLabel) checks
+      // THIS field, not sharesOwnedAfter -- a single vehicle hitting zero
+      // is a real full exit of THAT vehicle, but calling it a "Full exit"
+      // for the insider overall was the actual bug (verified live: Mark
+      // Zuckerberg's 2026-09-28 Form 4 fully liquidated "CZI Holdings, LLC"
+      // down to 0 while "Chan Zuckerberg Biohub, Inc." alone still held
+      // 1,220,703 shares of the same security afterward -- his real
+      // aggregate, totalBySecurity.get(securityTitle), is nowhere near
+      // zero). Per explicit product decision: only report "Full exit" when
+      // the insider's OWN total holdings of the security go to zero.
+      totalSharesOwnedAfter: totalBySecurity.get(securityTitle) || 0,
       // Human-readable counterpart to ownershipBucket, for DISPLAY -- the
       // bucket key itself is a machine grouping key, not UI text. null for
       // a direct holding (directOrIndirect === 'D', already fully
