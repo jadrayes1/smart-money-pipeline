@@ -82,6 +82,29 @@ async function fetchSubmissions(cik) {
   return fetchJson(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`);
 }
 
+// Every XML field in this repo's Form 4 parsing (generateInsiderActivity.js)
+// is pulled via a naive regex text-node grab, not a real XML parser -- so a
+// raw entity like `&amp;` in the filing's own XML survives untouched all
+// the way to the published JSON and then to the UI. Verified live: a real
+// Form 4's <officerTitle> reads "EVP, GC &amp; Secretary" verbatim, shown
+// to the user as literal "&amp;" instead of "&". Covers the 5 named XML
+// entities plus numeric (&#39; and &#x27; style) -- more complete than
+// generateTrendingSocial.js's own local decodeHtmlEntities (which only
+// handles &amp;/&apos;/&quot;, no &lt;/&gt;/numeric), kept here instead of
+// duplicated since every Form 4 text field in this repo goes through the
+// same naive extraction and could carry any of these.
+function decodeXmlEntities(str) {
+  if (!str) return str;
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/g, '&'); // last -- so a literal "&amp;amp;" in source only ever unescapes one level
+}
+
 module.exports = {
   SEC_USER_AGENT,
   FETCH_TIMEOUT_MS,
@@ -92,4 +115,5 @@ module.exports = {
   fetchTickerToCikMap,
   fetchCikToTickerMap,
   fetchSubmissions,
+  decodeXmlEntities,
 };

@@ -16,7 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { sleep, fetchJson, fetchText, fetchTickerToCikMap, fetchSubmissions } = require('./lib/secEdgar');
+const { sleep, fetchJson, fetchText, fetchTickerToCikMap, fetchSubmissions, decodeXmlEntities } = require('./lib/secEdgar');
 
 const OUTPUT_FILE = path.join(__dirname, '../insiderActivityCache.json');
 const GIST_ACTIVITY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/insiderActivityCache.json';
@@ -96,9 +96,9 @@ function ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership) 
 }
 
 function extractBlockFields(block) {
-  const securityTitle = block.match(/<securityTitle>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || null;
+  const securityTitle = decodeXmlEntities(block.match(/<securityTitle>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim()) || null;
   const directOrIndirect = block.match(/<directOrIndirectOwnership>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || null;
-  const natureOfOwnership = block.match(/<natureOfOwnership>\s*<value>([^<]*)<\/value>/i)?.[1]?.trim() || null;
+  const natureOfOwnership = decodeXmlEntities(block.match(/<natureOfOwnership>\s*<value>([^<]*)<\/value>/i)?.[1]?.trim()) || null;
   const sharesOwnedAfter = parseFloat(block.match(/<sharesOwnedFollowingTransaction>\s*<value>([^<]+)<\/value>/i)?.[1] || 'NaN');
   return { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter: Number.isNaN(sharesOwnedAfter) ? null : sharesOwnedAfter };
 }
@@ -174,11 +174,11 @@ function normalizeInsiderName(name) {
 // verified live against a real current Apple Form 4 before writing this.
 function parseForm4(xml) {
   const issuerTicker = xml.match(/<issuerTradingSymbol>([^<]*)<\/issuerTradingSymbol>/i)?.[1]?.trim();
-  const ownerName = normalizeInsiderName(xml.match(/<rptOwnerName>([^<]*)<\/rptOwnerName>/i)?.[1]?.trim());
+  const ownerName = normalizeInsiderName(decodeXmlEntities(xml.match(/<rptOwnerName>([^<]*)<\/rptOwnerName>/i)?.[1]?.trim()));
   const isOfficer = /<isOfficer>\s*1|true\s*<\/isOfficer>/i.test(xml);
   const isDirector = /<isDirector>\s*1|true\s*<\/isDirector>/i.test(xml);
   const isTenPercentOwner = /<isTenPercentOwner>\s*1|true\s*<\/isTenPercentOwner>/i.test(xml);
-  const officerTitle = xml.match(/<officerTitle>([^<]*)<\/officerTitle>/i)?.[1]?.trim() || null;
+  const officerTitle = decodeXmlEntities(xml.match(/<officerTitle>([^<]*)<\/officerTitle>/i)?.[1]?.trim()) || null;
 
   const transactions = [];
   const blocks = xml.match(/<nonDerivativeTransaction>[\s\S]*?<\/nonDerivativeTransaction>/gi) || [];
