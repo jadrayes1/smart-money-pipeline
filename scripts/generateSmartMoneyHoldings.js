@@ -110,6 +110,14 @@ function parseInfoTable(xml) {
     const value = parseFloat(block.match(/<[a-zA-Z0-9]*:?value>([^<]+)<\/[a-zA-Z0-9]*:?value>/i)?.[1] || 'NaN');
     const shares = parseFloat(block.match(/<[a-zA-Z0-9]*:?sshPrnamt>([^<]+)<\/[a-zA-Z0-9]*:?sshPrnamt>/i)?.[1] || 'NaN');
     if (!cusip || Number.isNaN(value) || Number.isNaN(shares)) continue;
+    // Verified live (Soros, period 2026-06-30): four of the fund's top-10
+    // positions are convertible NOTES ("NOTE 1.500% 3/0", amountType PRN --
+    // principal dollars, not shares) and its Rivian common row is actually
+    // a CALL option. Without these three fields the app showed "247,500,000
+    // shares" for a $247.5M note and treated an option as stock.
+    const titleOfClass = decodeXmlEntities(block.match(/<[a-zA-Z0-9]*:?titleOfClass>([^<]+)<\/[a-zA-Z0-9]*:?titleOfClass>/i)?.[1]?.trim()) || null;
+    const amountType = block.match(/<[a-zA-Z0-9]*:?sshPrnamtType>([^<]+)<\/[a-zA-Z0-9]*:?sshPrnamtType>/i)?.[1]?.trim().toUpperCase() || null;
+    const putCall = block.match(/<[a-zA-Z0-9]*:?putCall>([^<]+)<\/[a-zA-Z0-9]*:?putCall>/i)?.[1]?.trim() || null;
     // NOT multiplied by 1000 despite Form 13F's nominal "report value in
     // thousands" instruction — verified live against Berkshire's actual
     // latest filing: raw value/shares for its Ally Financial position
@@ -117,7 +125,11 @@ function parseInfoTable(xml) {
     // real trading range), vs ~$39,230/share if treated as thousands
     // (impossible - exceeds Ally's entire market cap many times over).
     // Modern filers evidently report actual dollars in this field now.
-    entries.push({ cusip, nameOfIssuer, value, shares });
+    const entry = { cusip, nameOfIssuer, value, shares };
+    if (titleOfClass) entry.titleOfClass = titleOfClass;
+    if (amountType === 'PRN') entry.amountType = 'PRN';
+    if (putCall) entry.putCall = putCall;
+    entries.push(entry);
   }
   return entries;
 }
@@ -125,18 +137,52 @@ function parseInfoTable(xml) {
 // Sums multiple sub-manager line items for the same CUSIP within one
 // filing into a single position — verified live this is real and common
 // (Berkshire's latest 13F: 6 separate Ally Financial entries).
+function isCommonStockPosition(p) {
+  return p.amountType !== 'PRN' && !p.putCall;
+}
+
+// A CUSIP's first 6 characters identify its ISSUER, so a convertible note
+// (76954AAB9) shares an issuer code with that company's common stock
+// (76954A103 -> RIVN). Only used when the code maps to exactly one equity
+// ticker in this dataset -- Alphabet's 02079K covers both GOOG and GOOGL,
+// so a note under it falls through to the bond-ticker fallback instead.
+function attachTickers(merged, cusipInfo) {
+  const tickersByIssuer = new Map();
+  for (const [cusip, info] of cusipInfo) {
+    if (!info.ticker) continue;
+    const issuer = cusip.slice(0, 6);
+    if (!tickersByIssuer.has(issuer)) tickersByIssuer.set(issuer, new Set());
+    tickersByIssuer.get(issuer).add(info.ticker);
+  }
+  for (const fund of Object.values(merged)) {
+    for (const p of fund.positions || []) {
+      const info = cusipInfo.get(p.cusip);
+      let ticker = info?.ticker || null;
+      if (!ticker && p.amountType === 'PRN') {
+        const issuerTickers = tickersByIssuer.get(p.cusip.slice(0, 6));
+        ticker = issuerTickers?.size === 1 ? [...issuerTickers][0] : info?.issuerTicker || null;
+      }
+      p.ticker = ticker;
+    }
+  }
+}
+
+// Keyed on putCall too: an option is reported under its UNDERLYING's CUSIP,
+// so a fund holding both the stock and calls on it would otherwise have the
+// option's underlying-share count summed into the stock row.
 function aggregateByCusip(entries) {
-  const byCusip = new Map();
+  const byKey = new Map();
   for (const e of entries) {
-    const existing = byCusip.get(e.cusip);
+    const key = `${e.cusip}|${e.putCall || ''}`;
+    const existing = byKey.get(key);
     if (existing) {
       existing.value += e.value;
       existing.shares += e.shares;
     } else {
-      byCusip.set(e.cusip, { ...e });
+      byKey.set(key, { ...e });
     }
   }
-  return Array.from(byCusip.values());
+  return Array.from(byKey.values());
 }
 
 async function fetchLatest13F(cik) {
@@ -203,20 +249,17 @@ async function mapCusipsToTickers(cusips) {
         // convention) instead of a card that LOOKS clickable but navigates
         // to a symbol that doesn't exist.
         const ticker = preferred?.ticker?.toUpperCase();
-        // securityType lets the app explain WHY a position has no ticker,
-        // rather than rendering a bond identically to a genuinely unmapped
-        // equity -- verified live (user-reported): a 13F fund can hold a
-        // company's corporate BOND (CUSIP suffix like "AL2"/"AF7", instead
-        // of the common stock's own CUSIP) alongside its stock, and that
-        // bond position can be large enough in dollars to also land in the
-        // SAME fund's top-10-holdings-by-value list -- e.g. "PG&E CORP"
-        // appearing twice, once as the real, clickable stock (ticker PCG)
-        // and once as a bond with no ticker at all (correct -- a bond has
-        // no stock ticker), but nothing distinguished the two rows from
-        // each other. Falls back to the first row's own sector when no
-        // Equity row exists at all (a bond CUSIP's rows are ALL "Corp").
-        const securityType = preferred?.marketSector || rows[0]?.marketSector || null;
-        result.set(batch[idx], { ticker: ticker && VALID_TICKER_FORMAT.test(ticker) ? ticker : null, securityType });
+        // A convertible note's CUSIP has no equity row at all, but OpenFIGI's
+        // bond ticker leads with the issuer's own stock ticker (Bloomberg
+        // convention) -- verified live: 76954AAB9 -> "RIVN 4.625 03/15/29",
+        // 69331CAL2 -> "PCG 4.25 12/01/27", 090043AF7 -> "BILL 0 04/01/30".
+        // Only a fallback: main() prefers the CUSIP issuer-code match first.
+        const corpRow = preferred ? null : rows.find((r) => r.marketSector === 'Corp');
+        const bondIssuerTicker = corpRow?.ticker?.split(' ')[0]?.toUpperCase();
+        result.set(batch[idx], {
+          ticker: ticker && VALID_TICKER_FORMAT.test(ticker) ? ticker : null,
+          issuerTicker: bondIssuerTicker && VALID_TICKER_FORMAT.test(bondIssuerTicker) ? bondIssuerTicker : null,
+        });
       });
     }
     await sleep(OPENFIGI_SPACING_MS);
@@ -291,8 +334,10 @@ async function attachPortfolioYtd(merged) {
   const topTenByFund = new Map();
   const allTickers = new Set();
   for (const [cik, fund] of Object.entries(merged)) {
+    // Shares-weighted, so only real common-stock rows -- a note's `shares`
+    // is principal dollars and an option's is underlying shares.
     const topTen = [...(fund.positions || [])]
-      .filter((p) => p.ticker)
+      .filter((p) => p.ticker && isCommonStockPosition(p))
       .sort((a, b) => b.value - a.value)
       .slice(0, 10);
     topTenByFund.set(cik, topTen);
@@ -402,24 +447,15 @@ async function main() {
   // coveredUniverse the way `holdings` is -- a fund's real #1 holding
   // should still show up in ITS OWN profile even if this app doesn't
   // separately track that ticker elsewhere.
-  for (const fund of Object.values(merged)) {
-    for (const p of fund.positions || []) {
-      const info = cusipInfo.get(p.cusip);
-      p.ticker = info?.ticker || null;
-      // Non-null only for a position OpenFIGI itself resolved to something
-      // other than a plain US equity (e.g. "Corp" for a corporate bond) --
-      // lets the app distinguish "no ticker because this is a bond" from
-      // "no ticker because we just couldn't map this CUSIP at all". Not
-      // published for a plain equity match (securityType "Equity"), so
-      // this stays absent for the overwhelming majority of positions.
-      if (info?.securityType && info.securityType !== 'Equity') p.securityType = info.securityType;
-    }
-  }
+  attachTickers(merged, cusipInfo);
 
   const holdings = {};
   for (const fund of Object.values(merged)) {
     for (const p of fund.positions || []) {
       if (!p.ticker || !coveredUniverse.has(p.ticker)) continue; // not a ticker this app ever looks up
+      // The stock screen's carousel reads `shares` as common shares -- a
+      // note's is principal dollars, an option's is underlying shares.
+      if (!isCommonStockPosition(p)) continue;
       if (!holdings[p.ticker]) holdings[p.ticker] = [];
       holdings[p.ticker].push({
         investor: fund.investor,
@@ -441,7 +477,7 @@ async function main() {
   console.log(`Done. ${tickerCount} tickers have at least one tracked holder.`);
 }
 
-module.exports = { parseInfoTable, aggregateByCusip, pickHoldingsToPublish, mapCusipsToTickers, attachPortfolioYtd, FUND_ROSTER };
+module.exports = { parseInfoTable, aggregateByCusip, pickHoldingsToPublish, mapCusipsToTickers, attachTickers, attachPortfolioYtd, isCommonStockPosition, FUND_ROSTER };
 
 if (require.main === module) {
   main().catch((err) => {
