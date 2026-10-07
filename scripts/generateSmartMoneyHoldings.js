@@ -22,7 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { sleep, fetchJson, fetchText, fetchSubmissions, fetchWithTimeout } = require('./lib/secEdgar');
+const { sleep, fetchJson, fetchText, fetchSubmissions, fetchWithTimeout, decodeXmlEntities } = require('./lib/secEdgar');
 
 const OUTPUT_FILE = path.join(__dirname, '../smartMoneyHoldings.json');
 const GIST_HOLDINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/smartMoneyHoldings.json';
@@ -93,7 +93,14 @@ function parseInfoTable(xml) {
   const blocks = xml.match(/<[a-zA-Z0-9]*:?infoTable>[\s\S]*?<\/[a-zA-Z0-9]*:?infoTable>/gi) || [];
   for (const block of blocks) {
     const cusip = block.match(/<[a-zA-Z0-9]*:?cusip>([^<]+)<\/[a-zA-Z0-9]*:?cusip>/i)?.[1]?.trim();
-    const nameOfIssuer = block.match(/<[a-zA-Z0-9]*:?nameOfIssuer>([^<]+)<\/[a-zA-Z0-9]*:?nameOfIssuer>/i)?.[1]?.trim();
+    // Same naive regex-extraction gap as generateInsiderActivity.js's Form 4
+    // text fields -- verified live: Ken Griffin's (Citadel's) latest 13F
+    // lists "STATE STR SPDR S&amp;P 500 ETF T" verbatim, the raw XML entity
+    // never decoded. Previously left unfixed here on the (now outdated)
+    // assumption that nameOfIssuer was never actually displayed anywhere --
+    // it is now, via the new smart-money fund profile screen's top-10-
+    // holdings list (see fetchSmartMoneyFundProfile in stock-analyzer).
+    const nameOfIssuer = decodeXmlEntities(block.match(/<[a-zA-Z0-9]*:?nameOfIssuer>([^<]+)<\/[a-zA-Z0-9]*:?nameOfIssuer>/i)?.[1]?.trim());
     const value = parseFloat(block.match(/<[a-zA-Z0-9]*:?value>([^<]+)<\/[a-zA-Z0-9]*:?value>/i)?.[1] || 'NaN');
     const shares = parseFloat(block.match(/<[a-zA-Z0-9]*:?sshPrnamt>([^<]+)<\/[a-zA-Z0-9]*:?sshPrnamt>/i)?.[1] || 'NaN');
     if (!cusip || Number.isNaN(value) || Number.isNaN(shares)) continue;
