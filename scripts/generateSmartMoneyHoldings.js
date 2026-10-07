@@ -203,7 +203,20 @@ async function mapCusipsToTickers(cusips) {
         // convention) instead of a card that LOOKS clickable but navigates
         // to a symbol that doesn't exist.
         const ticker = preferred?.ticker?.toUpperCase();
-        if (ticker && VALID_TICKER_FORMAT.test(ticker)) result.set(batch[idx], ticker);
+        // securityType lets the app explain WHY a position has no ticker,
+        // rather than rendering a bond identically to a genuinely unmapped
+        // equity -- verified live (user-reported): a 13F fund can hold a
+        // company's corporate BOND (CUSIP suffix like "AL2"/"AF7", instead
+        // of the common stock's own CUSIP) alongside its stock, and that
+        // bond position can be large enough in dollars to also land in the
+        // SAME fund's top-10-holdings-by-value list -- e.g. "PG&E CORP"
+        // appearing twice, once as the real, clickable stock (ticker PCG)
+        // and once as a bond with no ticker at all (correct -- a bond has
+        // no stock ticker), but nothing distinguished the two rows from
+        // each other. Falls back to the first row's own sector when no
+        // Equity row exists at all (a bond CUSIP's rows are ALL "Corp").
+        const securityType = preferred?.marketSector || rows[0]?.marketSector || null;
+        result.set(batch[idx], { ticker: ticker && VALID_TICKER_FORMAT.test(ticker) ? ticker : null, securityType });
       });
     }
     await sleep(OPENFIGI_SPACING_MS);
@@ -376,8 +389,8 @@ async function main() {
     for (const p of fund.positions || []) allCusips.add(p.cusip);
   }
   console.log(`Mapping ${allCusips.size} distinct CUSIPs to tickers via OpenFIGI...`);
-  const cusipToTicker = await mapCusipsToTickers(Array.from(allCusips));
-  console.log(`Resolved ${cusipToTicker.size} of ${allCusips.size} CUSIPs.`);
+  const cusipInfo = await mapCusipsToTickers(Array.from(allCusips));
+  console.log(`Resolved ${cusipInfo.size} of ${allCusips.size} CUSIPs.`);
 
   // Attached onto each position's OWN entry here -- previously
   // cusipToTicker only ever fed the ticker-keyed `holdings` inversion
@@ -391,7 +404,15 @@ async function main() {
   // separately track that ticker elsewhere.
   for (const fund of Object.values(merged)) {
     for (const p of fund.positions || []) {
-      p.ticker = cusipToTicker.get(p.cusip) || null;
+      const info = cusipInfo.get(p.cusip);
+      p.ticker = info?.ticker || null;
+      // Non-null only for a position OpenFIGI itself resolved to something
+      // other than a plain US equity (e.g. "Corp" for a corporate bond) --
+      // lets the app distinguish "no ticker because this is a bond" from
+      // "no ticker because we just couldn't map this CUSIP at all". Not
+      // published for a plain equity match (securityType "Equity"), so
+      // this stays absent for the overwhelming majority of positions.
+      if (info?.securityType && info.securityType !== 'Equity') p.securityType = info.securityType;
     }
   }
 
