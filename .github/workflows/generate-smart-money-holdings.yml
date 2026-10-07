@@ -53,6 +53,17 @@ jobs:
           node-version: '20'
 
       - name: Generate smart money holdings
+        env:
+          # Optional -- powers each fund's portfolioYtd figure (top-10-
+          # holdings-weighted YTD return, see attachPortfolioYtd's own
+          # comment). Not yet added as a repo secret; the script detects
+          # its absence and skips just that one field, publishing
+          # everything else normally. Free-tier Twelve Data key, same
+          # provider already used by stock-metrics-pipeline's
+          # generatePfcfTrendCache.js -- a SEPARATE key from that repo's
+          # own (sharing one key across repos would silently halve both
+          # pipelines' effective daily budget).
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
         run: node scripts/generateSmartMoneyHoldings.js
 
       # Git-clone-based publish, not `gh gist edit` — the output file is

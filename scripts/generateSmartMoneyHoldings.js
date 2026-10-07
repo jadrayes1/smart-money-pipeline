@@ -203,6 +203,93 @@ async function fetchPreviouslyPublished() {
   }
 }
 
+const TWELVEDATA_REQUEST_SPACING_MS = 8000; // mirrors stock-metrics-pipeline/generatePfcfTrendCache.js's own pacing — ~7.5/min, under Twelve Data's free-tier 8/min cap
+
+// One call per distinct ticker returns BOTH the current price and a real
+// year-start anchor (the monthly interval naturally includes a bar at/near
+// Jan 1) -- no separate "price on date X" lookup needed. outputsize=14
+// comfortably covers back past January even when run in December.
+async function fetchMonthlyCloses(symbol, apiKey) {
+  const data = await fetchJson(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=14&apikey=${apiKey}`);
+  if (data?.status !== 'ok' || !Array.isArray(data.values)) return [];
+  return data.values
+    .map((v) => ({ date: v.datetime, close: parseFloat(v.close) }))
+    .filter((v) => !Number.isNaN(v.close))
+    .sort((a, b) => new Date(a.date) - new Date(b.date)); // ascending -- Twelve Data returns newest-first
+}
+
+// Mutates each fund in `merged`, adding `portfolioYtd: { value, asOfDate,
+// basedOnPositions }` (or leaving it absent on any failure/no-key, same
+// graceful-degradation philosophy as every other optional field in these
+// pipelines -- a profile screen with no YTD figure is better than one
+// that's silently wrong). Deliberately an APPROXIMATION, disclosed as such
+// via basedOnPositions: computed only from each fund's own top 10
+// positions BY VALUE (not the full portfolio -- bounds the Twelve Data
+// budget to a knowable ceiling regardless of roster size), and assumes
+// the CURRENT share count was held for the whole year (13F only discloses
+// a point-in-time snapshot, never intra-year trading) -- the same
+// "current holdings, applied backward" convention retail portfolio
+// trackers commonly use when real cost-basis/trade-date data isn't
+// available, not a precision performance-attribution figure.
+async function attachPortfolioYtd(merged) {
+  const apiKey = process.env.TWELVEDATA_API_KEY;
+  if (!apiKey) {
+    console.log('  TWELVEDATA_API_KEY not set -- skipping portfolio YTD (every other field still publishes normally).');
+    return;
+  }
+
+  const topTenByFund = new Map();
+  const allTickers = new Set();
+  for (const [cik, fund] of Object.entries(merged)) {
+    const topTen = [...(fund.positions || [])]
+      .filter((p) => p.ticker)
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 10);
+    topTenByFund.set(cik, topTen);
+    for (const p of topTen) allTickers.add(p.ticker);
+  }
+
+  console.log(`  Fetching monthly prices for ${allTickers.size} distinct top-10-holding tickers (portfolio YTD)...`);
+  const closesByTicker = new Map();
+  for (const ticker of allTickers) {
+    try {
+      closesByTicker.set(ticker, await fetchMonthlyCloses(ticker, apiKey));
+    } catch (err) {
+      console.log(`    ${ticker}: price fetch failed (${err.message})`);
+    }
+    await sleep(TWELVEDATA_REQUEST_SPACING_MS);
+  }
+
+  const currentYear = new Date().getUTCFullYear();
+  for (const [cik, fund] of Object.entries(merged)) {
+    const topTen = topTenByFund.get(cik) || [];
+    let startValue = 0;
+    let currentValue = 0;
+    let used = 0;
+    let latestAsOf = null;
+    for (const p of topTen) {
+      const closes = closesByTicker.get(p.ticker);
+      if (!closes || closes.length < 2) continue;
+      // Year-start anchor: the last bar dated in the PRIOR year (closing
+      // price going into the current year) -- the conventional YTD
+      // baseline. Falls back to the earliest bar in the CURRENT year
+      // (e.g. a ticker that IPO'd after last year-end) rather than
+      // skipping the position entirely.
+      const priorYearBars = closes.filter((c) => new Date(c.date).getUTCFullYear() < currentYear);
+      const startBar = priorYearBars.length ? priorYearBars[priorYearBars.length - 1] : closes[0];
+      const latestBar = closes[closes.length - 1];
+      if (!startBar || !latestBar || startBar === latestBar) continue;
+      startValue += p.shares * startBar.close;
+      currentValue += p.shares * latestBar.close;
+      used++;
+      if (!latestAsOf || latestBar.date > latestAsOf) latestAsOf = latestBar.date;
+    }
+    if (used > 0 && startValue > 0) {
+      fund.portfolioYtd = { value: currentValue / startValue - 1, asOfDate: latestAsOf, basedOnPositions: used };
+    }
+  }
+}
+
 async function main() {
   console.log(`Fetching latest 13F-HR for ${FUND_ROSTER.length} tracked funds...`);
   const metricsDataset = await fetchJson(GIST_METRICS_URL);
@@ -255,13 +342,28 @@ async function main() {
   const cusipToTicker = await mapCusipsToTickers(Array.from(allCusips));
   console.log(`Resolved ${cusipToTicker.size} of ${allCusips.size} CUSIPs.`);
 
+  // Attached onto each position's OWN entry here -- previously
+  // cusipToTicker only ever fed the ticker-keyed `holdings` inversion
+  // below (and only for tickers in this app's own covered universe); a
+  // fund's full `positions` list (used for a per-fund profile view, e.g.
+  // "this investor's top 10 holdings") had no ticker at all, just a raw
+  // nameOfIssuer string, with no way to look up a live price for it or
+  // link it to the ticker's own screen. Deliberately NOT filtered by
+  // coveredUniverse the way `holdings` is -- a fund's real #1 holding
+  // should still show up in ITS OWN profile even if this app doesn't
+  // separately track that ticker elsewhere.
+  for (const fund of Object.values(merged)) {
+    for (const p of fund.positions || []) {
+      p.ticker = cusipToTicker.get(p.cusip) || null;
+    }
+  }
+
   const holdings = {};
   for (const fund of Object.values(merged)) {
     for (const p of fund.positions || []) {
-      const ticker = cusipToTicker.get(p.cusip);
-      if (!ticker || !coveredUniverse.has(ticker)) continue; // not a ticker this app ever looks up
-      if (!holdings[ticker]) holdings[ticker] = [];
-      holdings[ticker].push({
+      if (!p.ticker || !coveredUniverse.has(p.ticker)) continue; // not a ticker this app ever looks up
+      if (!holdings[p.ticker]) holdings[p.ticker] = [];
+      holdings[p.ticker].push({
         investor: fund.investor,
         fundName: fund.fundName,
         fundCik: fund.cik,
@@ -273,13 +375,15 @@ async function main() {
     }
   }
 
+  await attachPortfolioYtd(merged);
+
   const output = { generatedAt: new Date().toISOString(), byFund: merged, holdings };
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
   const tickerCount = Object.keys(holdings).length;
   console.log(`Done. ${tickerCount} tickers have at least one tracked holder.`);
 }
 
-module.exports = { parseInfoTable, aggregateByCusip, pickHoldingsToPublish, mapCusipsToTickers, FUND_ROSTER };
+module.exports = { parseInfoTable, aggregateByCusip, pickHoldingsToPublish, mapCusipsToTickers, attachPortfolioYtd, FUND_ROSTER };
 
 if (require.main === module) {
   main().catch((err) => {
