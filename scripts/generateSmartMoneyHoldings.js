@@ -31,6 +31,12 @@ const OPENFIGI_URL = 'https://api.openfigi.com/v3/mapping';
 const OPENFIGI_BATCH_SIZE = 10; // unauthenticated cap
 const OPENFIGI_SPACING_MS = 2600; // keeps well under 25 req/min unauthenticated
 const SEC_SPACING_MS = 200;
+// A real US common-stock ticker: 1-5 letters, optionally with a single
+// "."/"-" share-class suffix (e.g. "BRK.A"/"BRK-B") -- see
+// mapCusipsToTickers' own comment for why this rejects OpenFIGI's foreign-
+// cross-listing suffix convention ("EA*", "LEG1*") rather than trying to
+// strip it back to the real ticker.
+const VALID_TICKER_FORMAT = /^[A-Z]{1,5}([.-][A-Z])?$/;
 
 // Confirmed via LIVE SEC EDGAR lookups (not recalled from memory — a wrong
 // CIK silently pulls the wrong fund's data). Cross-checked by which entity
@@ -178,7 +184,26 @@ async function mapCusipsToTickers(cusips) {
         const rows = entry?.data;
         if (!Array.isArray(rows) || !rows.length) return;
         const preferred = rows.find((r) => r.marketSector === 'Equity' && r.exchCode === 'US') || rows.find((r) => r.marketSector === 'Equity');
-        if (preferred?.ticker) result.set(batch[idx], preferred.ticker.toUpperCase());
+        // Verified live: Electronic Arts (CUSIP 285512109) has NO row at all
+        // with exchCode === 'US' -- the "preferred US" filter above falls
+        // through to the bare marketSector fallback, which lands on a
+        // Mexican BMV cross-listing, "EA*" (OpenFIGI's own convention of
+        // appending "*" -- sometimes with an extra disambiguating digit
+        // too, e.g. Leggett & Platt's "LEG1*" for its real ticker "LEG" --
+        // for a US stock's secondary foreign listing). Every one of 8
+        // distinct tickers audited live in the current published dataset
+        // had this exact shape, and OpenFIGI offers no clean alternative
+        // for ANY of them via this CUSIP lookup -- there is no reliable
+        // way to strip this back to the real ticker from the string alone
+        // (stripping just "*" would wrongly leave "LEG1"). Rejecting the
+        // whole match (VALID_TICKER_FORMAT) rather than guessing keeps
+        // this ticker-less, same as any other unmapped CUSIP -- the app
+        // already renders that correctly as a plain, non-broken card (see
+        // SmartMoneyProfileScreen's own p.ticker ? TouchableOpacity : View
+        // convention) instead of a card that LOOKS clickable but navigates
+        // to a symbol that doesn't exist.
+        const ticker = preferred?.ticker?.toUpperCase();
+        if (ticker && VALID_TICKER_FORMAT.test(ticker)) result.set(batch[idx], ticker);
       });
     }
     await sleep(OPENFIGI_SPACING_MS);
