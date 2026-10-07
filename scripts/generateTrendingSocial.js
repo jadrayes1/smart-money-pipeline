@@ -120,7 +120,11 @@ async function main() {
   // this run actually got real data for it.
   let previous = { reddit: [], stocktwits: [] };
   try {
-    const res = await fetch('https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendingSocialCache.json');
+    // Cache-busting query param -- see generateSectorMetrics.js's
+    // identical fix this session for the live-verified root cause:
+    // GitHub's raw-gist CDN can serve a genuinely stale file minutes
+    // after a real push.
+    const res = await fetch(`https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendingSocialCache.json?_cb=${Date.now()}`);
     if (res.ok) previous = await res.json();
   } catch {
     // First-ever run, or the gist fetch failed — fall through with empty previous.

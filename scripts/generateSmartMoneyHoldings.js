@@ -226,9 +226,14 @@ function pickHoldingsToPublish(existingByFund, freshByFund) {
   return merged;
 }
 
+// Cache-busting query param (not a change to fetchJson itself, shared
+// with Twelve Data calls that don't need it) -- see generateSectorMetrics
+// .js's identical fix this session for the live-verified root cause:
+// GitHub's raw-gist CDN can serve a genuinely stale file minutes after a
+// real push.
 async function fetchPreviouslyPublished() {
   try {
-    const data = await fetchJson(GIST_HOLDINGS_URL);
+    const data = await fetchJson(`${GIST_HOLDINGS_URL}?_cb=${Date.now()}`);
     return data?.byFund && typeof data.byFund === 'object' ? data.byFund : {};
   } catch {
     return {};
@@ -324,7 +329,7 @@ async function attachPortfolioYtd(merged) {
 
 async function main() {
   console.log(`Fetching latest 13F-HR for ${FUND_ROSTER.length} tracked funds...`);
-  const metricsDataset = await fetchJson(GIST_METRICS_URL);
+  const metricsDataset = await fetchJson(`${GIST_METRICS_URL}?_cb=${Date.now()}`);
   const coveredUniverse = new Set(Object.keys(metricsDataset?.metrics || {}));
   console.log(`Covered universe: ${coveredUniverse.size} tickers.`);
 

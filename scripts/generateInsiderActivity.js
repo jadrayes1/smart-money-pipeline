@@ -314,9 +314,13 @@ function mergeTransactions(existing, fresh, cutoffDate) {
   return Array.from(byKey.values()).sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
 }
 
+// Cache-busting query param (not a change to fetchJson itself, shared
+// with SEC calls that don't need it) -- see generateSectorMetrics.js's
+// identical fix this session for the live-verified root cause: GitHub's
+// raw-gist CDN can serve a genuinely stale file minutes after a real push.
 async function fetchPreviouslyPublished() {
   try {
-    const data = await fetchJson(GIST_ACTIVITY_URL);
+    const data = await fetchJson(`${GIST_ACTIVITY_URL}?_cb=${Date.now()}`);
     return data?.transactions && typeof data.transactions === 'object' ? data.transactions : {};
   } catch {
     return {};
@@ -324,7 +328,7 @@ async function fetchPreviouslyPublished() {
 }
 
 async function main() {
-  const metricsDataset = await fetchJson(GIST_METRICS_URL);
+  const metricsDataset = await fetchJson(`${GIST_METRICS_URL}?_cb=${Date.now()}`);
   const coveredTickers = Object.keys(metricsDataset?.metrics || {});
   console.log(`Covered universe: ${coveredTickers.length} tickers.`);
 
