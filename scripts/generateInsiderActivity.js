@@ -312,11 +312,30 @@ function form4XmlUrl(cik, accessionNumber, primaryDocument) {
 // — a transient per-ticker SEC fetch failure in one run shouldn't wipe that
 // ticker's real recent activity, but activity aging out of the window
 // should still drop off rather than accumulate forever.
-function mergeTransactions(existing, fresh, cutoffDate) {
+//
+// A pure union, though, also makes a previously-published WRONG entry
+// immortal until it ages out: re-running with a corrected parser republishes
+// the bad record straight back. Verified live: after the issuer check above
+// started correctly excluding Uber's Aurora Form 4, a full successful run
+// still republished it under UBER, because the stale copy came back through
+// `existing`. So when a ticker's scan completed with NO fetch or parse
+// failure (`authoritative`), the fresh set is the truth for the window the
+// scan actually covered, and existing entries filed inside that window are
+// dropped rather than merged. Entries filed BEFORE the window are always
+// kept -- the scan never looked at them, so it can't contradict them.
+//
+// Safe because the scan window (LOOKBACK_DAYS, by filing date) is wider
+// than the published window (RETENTION_DAYS, by transaction date), and
+// Form 4 is due within two business days of the transaction: anything still
+// retained was filed inside the scanned window, so a clean scan has really
+// seen it. An entry with no filedAt at all is kept, since we cannot tell
+// which side of the window it came from.
+function mergeTransactions(existing, fresh, cutoffDate, { authoritative = false, sinceDate = null } = {}) {
   const key = (t) => `${t.cik}|${t.transactionDate}|${t.transactionCode}|${t.sharesTransacted}`;
+  const supersededByScan = (t) => authoritative && sinceDate && t.filedAt && new Date(t.filedAt) >= sinceDate;
   const byKey = new Map();
   for (const t of existing || []) {
-    if (new Date(t.transactionDate) >= cutoffDate) byKey.set(key(t), t);
+    if (new Date(t.transactionDate) >= cutoffDate && !supersededByScan(t)) byKey.set(key(t), t);
   }
   for (const t of fresh || []) {
     byKey.set(key(t), t);
@@ -348,6 +367,7 @@ async function main() {
   const cutoffDate = daysAgo(RETENTION_DAYS);
 
   const freshByTicker = {};
+  const scanCompleteByTicker = {};
   let scanned = 0;
   let withActivity = 0;
 
@@ -355,22 +375,30 @@ async function main() {
     const cik = tickerToCik.get(ticker);
     scanned++;
     if (!cik) continue;
+    // Tracks whether this ticker's scan saw everything it meant to. Any
+    // fetch or parse failure makes the fresh set incomplete, so it must not
+    // be treated as authoritative when merging (see mergeTransactions).
+    // Deliberately excluding a cross-issuer filing is NOT a failure.
+    let scanComplete = true;
+    const transactions = [];
     try {
       const filings = await fetchRecentForm4Filings(cik, sinceDate);
       await sleep(SEC_SPACING_MS);
-      if (!filings.length) continue;
 
-      const transactions = [];
       for (const filing of filings) {
         const url = form4XmlUrl(cik, filing.accessionNumber, filing.primaryDocument);
         const xml = await fetchText(url);
         await sleep(SEC_SPACING_MS);
         if (!xml) {
           console.log(`  ${ticker}: 404/empty fetching ${url}`);
+          scanComplete = false;
           continue;
         }
         const parsed = parseForm4(xml);
-        if (!parsed) continue;
+        if (!parsed) {
+          scanComplete = false;
+          continue;
+        }
         // A CIK's submissions feed lists every Form 4 that CIK is a PARTY
         // to -- including the ones where it is the REPORTING OWNER rather
         // than the issuer. Those are an insider transaction in SOMEONE
@@ -400,20 +428,27 @@ async function main() {
           });
         }
       }
-      if (transactions.length) {
-        freshByTicker[ticker] = transactions;
-        withActivity++;
-      }
     } catch (err) {
       console.log(`  ${ticker}: failed (${err.message})`);
+      scanComplete = false;
     }
+    // Recorded even when empty: a ticker whose only recent Form 4s were all
+    // cross-issuer (verified live: every recent filing under DSX was really
+    // about Genco Shipping/GNK) must still reach mergeTransactions, or its
+    // previously-published bad entries are never challenged at all.
+    freshByTicker[ticker] = transactions;
+    scanCompleteByTicker[ticker] = scanComplete;
+    if (transactions.length) withActivity++;
     if (scanned % 250 === 0) console.log(`  ...scanned ${scanned}/${coveredTickers.length}, ${withActivity} with signal activity so far`);
   }
 
   const merged = {};
   const allTickers = new Set([...Object.keys(previouslyPublished), ...Object.keys(freshByTicker)]);
   for (const ticker of allTickers) {
-    const result = mergeTransactions(previouslyPublished[ticker], freshByTicker[ticker], cutoffDate);
+    const result = mergeTransactions(previouslyPublished[ticker], freshByTicker[ticker], cutoffDate, {
+      authoritative: scanCompleteByTicker[ticker] === true,
+      sinceDate,
+    });
     if (result.length) merged[ticker] = result;
   }
 
