@@ -396,7 +396,18 @@ async function main() {
         }
         const parsed = parseForm4(xml);
         if (!parsed) {
-          scanComplete = false;
+          // parseForm4 returns null when a Form 4 reports no NON-DERIVATIVE
+          // transactions -- an ordinary, successful outcome (RSU vesting and
+          // option activity live in the derivative table), NOT a failure.
+          // Verified live: 5 of UBER's 9 Form 4s in the window are
+          // derivative-only, and counting those as failures made the whole
+          // ticker non-authoritative, which silently blocked the retraction
+          // of its stale Aurora entry below. Only a document that doesn't
+          // even look like a Form 4 means the scan really missed something.
+          if (!/<ownershipDocument[\s>]/i.test(xml)) {
+            console.log(`  ${ticker}: unparseable Form 4 ${url}`);
+            scanComplete = false;
+          }
           continue;
         }
         // A CIK's submissions feed lists every Form 4 that CIK is a PARTY
