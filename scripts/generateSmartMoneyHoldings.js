@@ -275,7 +275,13 @@ function pickHoldingsToPublish(existingByFund, freshByFund) {
   const merged = { ...existingByFund };
   for (const [cik, fresh] of Object.entries(freshByFund)) {
     const existing = existingByFund[cik];
-    if (!existing || !existing.reportPeriod || (fresh.reportPeriod && fresh.reportPeriod > existing.reportPeriod)) {
+    // Same period counts too, as long as the fresh parse isn't empty -- it's
+    // a re-parse of the same filing, so a parser fix must be able to replace
+    // it. Verified live: with strict ">" the convertible-note fix re-parsed
+    // Soros's 2026-06-30 13F correctly, then discarded it for the stale
+    // cached copy of that same filing.
+    const freshUsable = (fresh.positions || []).length > 0;
+    if (!existing || !existing.reportPeriod || (fresh.reportPeriod && freshUsable && fresh.reportPeriod >= existing.reportPeriod)) {
       merged[cik] = fresh;
     }
   }
