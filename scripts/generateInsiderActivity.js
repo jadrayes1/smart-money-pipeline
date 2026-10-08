@@ -174,6 +174,7 @@ function normalizeInsiderName(name) {
 // verified live against a real current Apple Form 4 before writing this.
 function parseForm4(xml) {
   const issuerTicker = xml.match(/<issuerTradingSymbol>([^<]*)<\/issuerTradingSymbol>/i)?.[1]?.trim();
+  const issuerCik = xml.match(/<issuerCik>([^<]*)<\/issuerCik>/i)?.[1]?.trim();
   const ownerName = normalizeInsiderName(decodeXmlEntities(xml.match(/<rptOwnerName>([^<]*)<\/rptOwnerName>/i)?.[1]?.trim()));
   const isOfficer = /<isOfficer>\s*1|true\s*<\/isOfficer>/i.test(xml);
   const isDirector = /<isDirector>\s*1|true\s*<\/isDirector>/i.test(xml);
@@ -260,7 +261,16 @@ function parseForm4(xml) {
     });
   }
   if (!transactions.length) return null;
-  return { issuerTicker, ownerName, isOfficer, isDirector, isTenPercentOwner, officerTitle, transactions };
+  return { issuerTicker, issuerCik, ownerName, isOfficer, isDirector, isTenPercentOwner, officerTitle, transactions };
+}
+
+// True when a parsed Form 4's ISSUER is the company we are scanning, so a
+// filing where that company is merely the reporting owner can be skipped.
+// See the call site for the live-verified Uber/Aurora case this exists for.
+function isIssuedBy(parsed, cik, ticker) {
+  if (parsed.issuerCik) return Number(parsed.issuerCik) === Number(cik);
+  if (parsed.issuerTicker) return parsed.issuerTicker.toUpperCase() === ticker.toUpperCase();
+  return true;
 }
 
 async function fetchRecentForm4Filings(cik, sinceDate) {
@@ -361,6 +371,22 @@ async function main() {
         }
         const parsed = parseForm4(xml);
         if (!parsed) continue;
+        // A CIK's submissions feed lists every Form 4 that CIK is a PARTY
+        // to -- including the ones where it is the REPORTING OWNER rather
+        // than the issuer. Those are an insider transaction in SOMEONE
+        // ELSE'S stock and belong under that issuer's ticker, never this
+        // one. Verified live: Uber Technologies is a 10% owner of Aurora
+        // Innovation (AUR) and filed a Form 4 on 2026-09-17 selling
+        // 29,369,611 AUR Class A shares at $6.205; with no issuer check it
+        // surfaced under UBER's own insider activity as an "insider" named
+        // "Uber Technologies, Inc" -- at a price nowhere near UBER's own
+        // ~$71, and with stakePercent computed against the wrong company's
+        // share count. Compare issuerCik (authoritative, always present)
+        // rather than issuerTradingSymbol, which is free text and is
+        // sometimes absent or stale; fall back to the symbol only when the
+        // CIK is missing, and keep the filing if neither is available so a
+        // parse gap never silently deletes real activity.
+        if (!isIssuedBy(parsed, cik, ticker)) continue;
         for (const t of parsed.transactions) {
           transactions.push({
             cik,
