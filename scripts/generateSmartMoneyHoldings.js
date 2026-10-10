@@ -205,7 +205,7 @@ async function fetchLatest13F(cik) {
 // common-stock listing (marketSector "Equity", exchCode "US") when a CUSIP
 // maps to several exchange listings — verified live: a single US CUSIP
 // (Apple's) returns ~4 near-duplicate rows differing only by exchCode.
-async function mapCusipsToTickers(cusips) {
+async function mapIdsToTickers(cusips, idType) {
   const result = new Map();
   for (let i = 0; i < cusips.length; i += OPENFIGI_BATCH_SIZE) {
     const batch = cusips.slice(i, i + OPENFIGI_BATCH_SIZE);
@@ -218,7 +218,7 @@ async function mapCusipsToTickers(cusips) {
       res = await fetchWithTimeout(OPENFIGI_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(batch.map((c) => ({ idType: 'ID_CUSIP', idValue: c }))),
+        body: JSON.stringify(batch.map((c) => ({ idType, idValue: c }))),
       });
     } catch {
       await sleep(OPENFIGI_SPACING_MS);
@@ -264,6 +264,43 @@ async function mapCusipsToTickers(cusips) {
     }
     await sleep(OPENFIGI_SPACING_MS);
   }
+  return result;
+}
+
+// A 13F reports a FOREIGN-domiciled issuer under its CINS identifier (the
+// CUSIP International Numbering System), which looks like a CUSIP but
+// starts with a letter encoding the domicile -- G for the UK and Channel
+// Islands, N for the Netherlands, H for Switzerland, and so on. OpenFIGI's
+// ID_CUSIP lookup rejects every one of them outright ("No identifier
+// found."), so the position silently lost its ticker: no clickable card, no
+// row in the per-ticker holder index, and no contribution to portfolio YTD.
+//
+// This is not a long-tail problem. Measured live against the published
+// dataset: 598 of the 809 distinct unresolved common-stock CUSIPs (74%)
+// were CINS, and they are ordinary large US-listed names -- Chubb
+// (H1467J104 -> CB), AerCap (N00985106 -> AER), Amcor, Amdocs, Aon, Aptiv,
+// Arch Capital, ASML, CRH. A 20-CUSIP sample re-queried under ID_CINS
+// resolved 20 of 20 to a valid US ticker.
+//
+// Retrying under ID_CINS costs one extra batched pass over ONLY the CUSIPs
+// the first pass failed to resolve, and cannot change any CUSIP the first
+// pass already answered.
+async function mapCusipsToTickers(cusips) {
+  const result = await mapIdsToTickers(cusips, 'ID_CUSIP');
+  const unresolved = cusips.filter((c) => {
+    const hit = result.get(c);
+    return !hit || (!hit.ticker && !hit.issuerTicker);
+  });
+  if (!unresolved.length) return result;
+
+  const viaCins = await mapIdsToTickers(unresolved, 'ID_CINS');
+  let recovered = 0;
+  for (const [cusip, hit] of viaCins) {
+    if (!hit || (!hit.ticker && !hit.issuerTicker)) continue;
+    result.set(cusip, hit);
+    recovered++;
+  }
+  console.log(`  OpenFIGI: ${unresolved.length} CUSIP(s) unresolved by ID_CUSIP, ${recovered} recovered via ID_CINS.`);
   return result;
 }
 
