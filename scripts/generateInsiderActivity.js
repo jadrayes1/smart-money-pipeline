@@ -30,6 +30,7 @@ const RETENTION_DAYS = 30; // published window shown to users
 // etc.) reflects routine compensation mechanics or a non-market transfer,
 // not a discretionary trading decision.
 const SIGNAL_CODES = new Set(['P', 'S']);
+const EXERCISE_CODES = new Set(['M', 'C', 'X']); // option exercise, conversion, in-the-money exercise
 
 function daysAgo(days) {
   const d = new Date();
@@ -185,6 +186,23 @@ function parseForm4(xml) {
   const blocks = xml.match(/<nonDerivativeTransaction>[\s\S]*?<\/nonDerivativeTransaction>/gi) || [];
   const holdingBlocks = xml.match(/<nonDerivativeHolding>[\s\S]*?<\/nonDerivativeHolding>/gi) || [];
   const { bucketFinalBalance, totalBySecurity } = resolveOwnershipBuckets(blocks, holdingBlocks);
+  // Earliest exercise/conversion INTO each security in this filing (codes
+  // M option exercise, C conversion, X in-the-money exercise). A sale on or
+  // after it sells shares the exercise just created, so "% of stake" would
+  // be measured against a stake that did not exist the day before. Verified
+  // live: CoreWeave's CRO Jonathan Jones held 0 shares, exercised 42,772 on
+  // 2026-10-11 and sold 37,380 over the next two days, which read as
+  // "sold 37% of stake" and then "80% of stake".
+  const firstExerciseBySecurity = new Map();
+  for (const block of blocks) {
+    const code = block.match(/<transactionCode>([^<]+)<\/transactionCode>/i)?.[1]?.trim();
+    const ad = block.match(/<transactionAcquiredDisposedCode>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
+    const date = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
+    if (!EXERCISE_CODES.has(code) || ad !== 'A' || !date) continue;
+    const { securityTitle } = extractBlockFields(block);
+    const prev = firstExerciseBySecurity.get(securityTitle);
+    if (!prev || date < prev) firstExerciseBySecurity.set(securityTitle, date);
+  }
   for (const block of blocks) {
     const transactionDate = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
     const transactionCode = block.match(/<transactionCode>([^<]+)<\/transactionCode>/i)?.[1]?.trim();
@@ -204,7 +222,11 @@ function parseForm4(xml) {
     const bucketKey = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
     const thisBucketFinalBalance = bucketFinalBalance.get(bucketKey) ?? ownedAfter ?? 0;
     const otherHoldingsShares = (totalBySecurity.get(securityTitle) || 0) - thisBucketFinalBalance;
-    const { stakePercent, isNewPosition } = computeStakeSignificance(shares, ownedAfter, acquiredDisposed, otherHoldingsShares);
+    const exercisedOn = firstExerciseBySecurity.get(securityTitle);
+    const exerciseAndSale = transactionCode === 'S' && !!exercisedOn && exercisedOn.slice(0, 10) <= transactionDate.slice(0, 10);
+    const significance = computeStakeSignificance(shares, ownedAfter, acquiredDisposed, otherHoldingsShares);
+    const stakePercent = exerciseAndSale ? null : significance.stakePercent;
+    const { isNewPosition } = significance;
     transactions.push({
       transactionDate,
       transactionCode,
@@ -244,7 +266,13 @@ function parseForm4(xml) {
       // aggregate, totalBySecurity.get(securityTitle), is nowhere near
       // zero). Per explicit product decision: only report "Full exit" when
       // the insider's OWN total holdings of the security go to zero.
-      totalSharesOwnedAfter: totalBySecurity.get(securityTitle) || 0,
+      //
+      // This row's OWN running balance plus every other vehicle's -- not the
+      // filing's end-of-filing total stamped on every row. A Form 4 can span
+      // several days: Jones's 2026-10-12 sale left 26,961 shares, but the
+      // filing ends at 5,392 after the next day's sales, and the 10-12 row
+      // used to report 5,392.
+      totalSharesOwnedAfter: ownedAfter != null ? ownedAfter + Math.max(otherHoldingsShares, 0) : totalBySecurity.get(securityTitle) || 0,
       // Human-readable counterpart to ownershipBucket, for DISPLAY -- the
       // bucket key itself is a machine grouping key, not UI text. null for
       // a direct holding (directOrIndirect === 'D', already fully
@@ -258,6 +286,10 @@ function parseForm4(xml) {
       ownershipLabel: directOrIndirect === 'I' && natureOfOwnership ? natureOfOwnership.replace(/^by\s+/i, '') : null,
       stakePercent,
       isNewPosition,
+      // A sale of shares an exercise/conversion in this same filing just
+      // created -- see firstExerciseBySecurity above. stakePercent is left
+      // null for these; the app labels them "Exercise & sale".
+      exerciseAndSale,
     });
   }
   if (!transactions.length) return null;
