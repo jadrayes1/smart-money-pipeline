@@ -193,15 +193,27 @@ function parseForm4(xml) {
   // live: CoreWeave's CRO Jonathan Jones held 0 shares, exercised 42,772 on
   // 2026-10-11 and sold 37,380 over the next two days, which read as
   // "sold 37% of stake" and then "80% of stake".
-  const firstExerciseBySecurity = new Map();
+  //
+  // Not every exercise-and-sale is a non-event, though: an insider with a
+  // large existing position can exercise a few options and sell far more
+  // (verified live: LUNR's Timothy Crain, ~350K shares). So the stake is
+  // measured against the holdings BEFORE the first exercise, as a net
+  // reduction: (pre-exercise total - total after this sale) / pre-exercise
+  // total. Jones's pre-exercise total is 0 -- no percentage, just the label.
+  const firstExerciseBySecurity = new Map(); // securityTitle -> {date, preExerciseTotal}
   for (const block of blocks) {
     const code = block.match(/<transactionCode>([^<]+)<\/transactionCode>/i)?.[1]?.trim();
     const ad = block.match(/<transactionAcquiredDisposedCode>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
     const date = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
+    const exShares = parseFloat(block.match(/<transactionShares>\s*<value>([^<]+)<\/value>/i)?.[1] || 'NaN');
     if (!EXERCISE_CODES.has(code) || ad !== 'A' || !date) continue;
-    const { securityTitle } = extractBlockFields(block);
+    const { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter } = extractBlockFields(block);
     const prev = firstExerciseBySecurity.get(securityTitle);
-    if (!prev || date < prev) firstExerciseBySecurity.set(securityTitle, date);
+    if (prev && prev.date <= date) continue;
+    const bucket = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
+    const others = (totalBySecurity.get(securityTitle) || 0) - (bucketFinalBalance.get(bucket) ?? sharesOwnedAfter ?? 0);
+    const preExerciseTotal = sharesOwnedAfter != null && Number.isFinite(exShares) ? Math.max(sharesOwnedAfter - exShares, 0) + Math.max(others, 0) : null;
+    firstExerciseBySecurity.set(securityTitle, { date, preExerciseTotal });
   }
   for (const block of blocks) {
     const transactionDate = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim();
@@ -222,10 +234,15 @@ function parseForm4(xml) {
     const bucketKey = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
     const thisBucketFinalBalance = bucketFinalBalance.get(bucketKey) ?? ownedAfter ?? 0;
     const otherHoldingsShares = (totalBySecurity.get(securityTitle) || 0) - thisBucketFinalBalance;
-    const exercisedOn = firstExerciseBySecurity.get(securityTitle);
-    const exerciseAndSale = transactionCode === 'S' && !!exercisedOn && exercisedOn.slice(0, 10) <= transactionDate.slice(0, 10);
+    const exercise = firstExerciseBySecurity.get(securityTitle);
+    const exerciseAndSale = transactionCode === 'S' && !!exercise && exercise.date.slice(0, 10) <= transactionDate.slice(0, 10);
     const significance = computeStakeSignificance(shares, ownedAfter, acquiredDisposed, otherHoldingsShares);
-    const stakePercent = exerciseAndSale ? null : significance.stakePercent;
+    const runningTotalAfter = ownedAfter != null ? ownedAfter + Math.max(otherHoldingsShares, 0) : null;
+    let stakePercent = significance.stakePercent;
+    if (exerciseAndSale) {
+      const pre = exercise.preExerciseTotal;
+      stakePercent = pre > 0 && runningTotalAfter != null ? Math.max(pre - runningTotalAfter, 0) / pre : null;
+    }
     const { isNewPosition } = significance;
     transactions.push({
       transactionDate,
@@ -272,7 +289,7 @@ function parseForm4(xml) {
       // several days: Jones's 2026-10-12 sale left 26,961 shares, but the
       // filing ends at 5,392 after the next day's sales, and the 10-12 row
       // used to report 5,392.
-      totalSharesOwnedAfter: ownedAfter != null ? ownedAfter + Math.max(otherHoldingsShares, 0) : totalBySecurity.get(securityTitle) || 0,
+      totalSharesOwnedAfter: runningTotalAfter ?? (totalBySecurity.get(securityTitle) || 0),
       // Human-readable counterpart to ownershipBucket, for DISPLAY -- the
       // bucket key itself is a machine grouping key, not UI text. null for
       // a direct holding (directOrIndirect === 'D', already fully
@@ -286,9 +303,10 @@ function parseForm4(xml) {
       ownershipLabel: directOrIndirect === 'I' && natureOfOwnership ? natureOfOwnership.replace(/^by\s+/i, '') : null,
       stakePercent,
       isNewPosition,
-      // A sale of shares an exercise/conversion in this same filing just
-      // created -- see firstExerciseBySecurity above. stakePercent is left
-      // null for these; the app labels them "Exercise & sale".
+      // A sale following an exercise/conversion in this same filing -- see
+      // firstExerciseBySecurity above. stakePercent is then the NET
+      // reduction of the pre-exercise holdings (null when there were none);
+      // the app labels these "Exercise & sale".
       exerciseAndSale,
     });
   }
