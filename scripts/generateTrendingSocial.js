@@ -37,6 +37,14 @@ const OUTPUT_FILE = path.join(__dirname, '../trendingSocialCache.json');
 const APEWISDOM_URL = 'https://apewisdom.io/api/v1.0/filter/all-stocks';
 const STOCKTWITS_URL = 'https://api.stocktwits.com/api/2/trending/symbols.json';
 const MAX_RESULTS = 20;
+// Fetched past MAX_RESULTS so a list still holds MAX_RESULTS companies after
+// share-class duplicates are merged out (see mergeShareClasses).
+const FETCH_RESULTS = 40;
+const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
+// A CIK with more tickers than this is a fund trust filing for many
+// unrelated ETFs (ProShares Trust II: UVXY, SVXY, UCO and 13 more), not one
+// company's share classes -- those stay separate.
+const MAX_SHARE_CLASSES_PER_CIK = 4;
 const USER_AGENT = 'stock-analyzer-app smart-money-pipeline contact:jadrayescpp@gmail.com';
 
 async function fetchJson(url) {
@@ -65,7 +73,7 @@ function decodeHtmlEntities(str) {
 async function fetchRedditTrending() {
   const data = await fetchJson(APEWISDOM_URL);
   const results = Array.isArray(data?.results) ? data.results : [];
-  return results.slice(0, MAX_RESULTS).map((r) => ({
+  return results.slice(0, FETCH_RESULTS).map((r) => ({
     rank: r.rank,
     symbol: r.ticker,
     name: decodeHtmlEntities(r.name),
@@ -91,7 +99,7 @@ async function fetchStockTwitsTrending() {
   const results = Array.isArray(data?.symbols) ? data.symbols : [];
   return results
     .filter(isTrackableInstrument)
-    .slice(0, MAX_RESULTS)
+    .slice(0, FETCH_RESULTS)
     .map((r, i) => ({
       rank: i + 1,
       symbol: r.symbol,
@@ -102,7 +110,51 @@ async function fetchStockTwitsTrending() {
     }));
 }
 
+// ticker -> CIK, for tickers whose CIK has at most MAX_SHARE_CLASSES_PER_CIK
+// tickers. Empty on failure: the lists then publish unmerged, as before.
+async function fetchShareClassCiks() {
+  try {
+    const data = await fetchJson(SEC_TICKERS_URL);
+    const tickersByCik = new Map();
+    for (const { ticker, cik_str: cik } of Object.values(data || {})) {
+      if (!tickersByCik.has(cik)) tickersByCik.set(cik, []);
+      tickersByCik.get(cik).push(ticker);
+    }
+    const cikByTicker = new Map();
+    for (const [cik, tickers] of tickersByCik) {
+      if (tickers.length > MAX_SHARE_CLASSES_PER_CIK) continue;
+      for (const t of tickers) cikByTicker.set(t, cik);
+    }
+    return cikByTicker;
+  } catch (err) {
+    console.log(`SEC ticker map fetch failed, share classes left unmerged: ${err.message}`);
+    return new Map();
+  }
+}
+
+// One row per company -- verified live: Reddit and StockTwits each listed
+// GOOG and GOOGL as two separate trending entries. Keeps the better-ranked
+// class's row as-is (its own counts, not a sum that might double-count a
+// post naming both), drops the rest, and renumbers. SEC writes BRK.B as
+// BRK-B; both spellings are looked up.
+function mergeShareClasses(rows, cikByTicker) {
+  if (!rows) return rows;
+  const seen = new Set();
+  const kept = [];
+  for (const row of rows) {
+    const symbol = String(row.symbol || '').toUpperCase();
+    const cik = cikByTicker.get(symbol) ?? cikByTicker.get(symbol.replace('.', '-'));
+    if (cik != null) {
+      if (seen.has(cik)) continue;
+      seen.add(cik);
+    }
+    kept.push(row);
+  }
+  return kept.slice(0, MAX_RESULTS).map((row, i) => ({ ...row, rank: i + 1 }));
+}
+
 async function main() {
+  const cikByTickerPromise = fetchShareClassCiks();
   const [reddit, stocktwits] = await Promise.all([
     fetchRedditTrending().catch((err) => {
       console.log(`Reddit (ApeWisdom) fetch failed: ${err.message}`);
@@ -113,6 +165,10 @@ async function main() {
       return null;
     }),
   ]);
+
+  const cikByTicker = await cikByTickerPromise;
+  const redditMerged = mergeShareClasses(reddit, cikByTicker);
+  const stocktwitsMerged = mergeShareClasses(stocktwits, cikByTicker);
 
   // Merge-protective, same philosophy as every other cache in this repo:
   // a transient failure on one source shouldn't wipe out what was
@@ -132,8 +188,8 @@ async function main() {
 
   const output = {
     generatedAt: new Date().toISOString(),
-    reddit: reddit ?? previous.reddit ?? [],
-    stocktwits: stocktwits ?? previous.stocktwits ?? [],
+    reddit: redditMerged ?? previous.reddit ?? [],
+    stocktwits: stocktwitsMerged ?? previous.stocktwits ?? [],
   };
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
