@@ -140,6 +140,13 @@ function resolveOwnershipBuckets(transactionBlocks, holdingBlocks) {
   return { bucketFinalBalance, totalBySecurity };
 }
 
+// A common-stock class title ("Common Stock", "Class A Common Stock",
+// "Common Stock - Non Voting", "Ordinary Shares") -- not preferred stock,
+// units, warrants or the like that Table I also carries.
+function isCommonStockTitle(title) {
+  return !!title && /common|ordinary/i.test(title) && !/preferred|warrant|unit|right|note|option/i.test(title);
+}
+
 // Table II balances -- options, RSUs and other derivatives -- still held
 // after the filing, summed per UNDERLYING security. Common stock at zero
 // isn't a full exit when the insider still holds options on it. Verified
@@ -227,6 +234,18 @@ function parseForm4(xml) {
   const holdingBlocks = xml.match(/<nonDerivativeHolding>[\s\S]*?<\/nonDerivativeHolding>/gi) || [];
   const { bucketFinalBalance, totalBySecurity } = resolveOwnershipBuckets(blocks, holdingBlocks);
   const derivativesBySecurity = resolveDerivativeHoldings(xml); // (securityTitle, date) -> total
+  // Shares held in the issuer's OTHER common-stock classes, for a stake
+  // measured across all of them -- they're the same ownership of the same
+  // company. Verified live: McCormick (MKC) director Gavin Hattersley
+  // bought 1,000 "Common Stock - Non Voting" (2,906 -> 3,906) while also
+  // holding 406 "Common Stock - Voting" in the same filing; measured
+  // within one class that read 34% of stake, 30% across both.
+  const otherCommonClassShares = (securityTitle) => {
+    if (!isCommonStockTitle(securityTitle)) return 0;
+    let total = 0;
+    for (const [title, shares] of totalBySecurity) if (title !== securityTitle && isCommonStockTitle(title)) total += shares;
+    return total;
+  };
   // Earliest exercise/conversion INTO each security in this filing (codes
   // M option exercise, C conversion, X in-the-money exercise). A sale on or
   // after it sells shares the exercise just created, so "% of stake" would
@@ -253,7 +272,8 @@ function parseForm4(xml) {
     if (prev && prev.date <= date) continue;
     const bucket = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
     const others = (totalBySecurity.get(securityTitle) || 0) - (bucketFinalBalance.get(bucket) ?? sharesOwnedAfter ?? 0);
-    const preExerciseTotal = sharesOwnedAfter != null && Number.isFinite(exShares) ? Math.max(sharesOwnedAfter - exShares, 0) + Math.max(others, 0) : null;
+    const preExerciseTotal =
+      sharesOwnedAfter != null && Number.isFinite(exShares) ? Math.max(sharesOwnedAfter - exShares, 0) + Math.max(others, 0) + otherCommonClassShares(securityTitle) : null;
     firstExerciseBySecurity.set(securityTitle, { date, preExerciseTotal });
   }
   for (const block of blocks) {
@@ -274,7 +294,7 @@ function parseForm4(xml) {
     const { securityTitle, directOrIndirect, natureOfOwnership } = extractBlockFields(block);
     const bucketKey = ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership);
     const thisBucketFinalBalance = bucketFinalBalance.get(bucketKey) ?? ownedAfter ?? 0;
-    const otherHoldingsShares = (totalBySecurity.get(securityTitle) || 0) - thisBucketFinalBalance;
+    const otherHoldingsShares = (totalBySecurity.get(securityTitle) || 0) - thisBucketFinalBalance + otherCommonClassShares(securityTitle);
     const exercise = firstExerciseBySecurity.get(securityTitle);
     const exerciseAndSale = transactionCode === 'S' && !!exercise && exercise.date.slice(0, 10) <= transactionDate.slice(0, 10);
     const significance = computeStakeSignificance(shares, ownedAfter, acquiredDisposed, otherHoldingsShares);
