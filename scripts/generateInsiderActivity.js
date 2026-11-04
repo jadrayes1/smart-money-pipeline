@@ -140,6 +140,46 @@ function resolveOwnershipBuckets(transactionBlocks, holdingBlocks) {
   return { bucketFinalBalance, totalBySecurity };
 }
 
+// Table II balances -- options, RSUs and other derivatives -- still held
+// after the filing, summed per UNDERLYING security. Common stock at zero
+// isn't a full exit when the insider still holds options on it. Verified
+// live: Venture Global's CFO exercised and sold 111,111 options on each of
+// 2026-10-19 and 10-20; each sale left 0 Class A shares, which read as
+// "Full exit" twice, but the same filing shows 17,823,880 vested options
+// still held. Bucketed per grant (title, strike, expiry, vehicle), keeping
+// each one's balance as of the trade's date (a filing can span several
+// days), same idea as the running totalSharesOwnedAfter.
+// Returns (underlyingTitle, date) -> total, or null when nothing is listed.
+function resolveDerivativeHoldings(xml) {
+  const derivBlocks = xml.match(/<derivative(?:Transaction|Holding)>[\s\S]*?<\/derivative(?:Transaction|Holding)>/gi) || [];
+  const grants = new Map(); // grant -> { underlying, rows: [{ date, balance }] } in document order
+  for (const block of derivBlocks) {
+    const { securityTitle, directOrIndirect, natureOfOwnership, sharesOwnedAfter } = extractBlockFields(block);
+    if (sharesOwnedAfter == null) continue;
+    const underlying = decodeXmlEntities(block.match(/<underlyingSecurityTitle>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim()) || null;
+    if (!underlying) continue;
+    const strike = block.match(/<conversionOrExercisePrice>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || '';
+    const expiry = block.match(/<expirationDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim() || '';
+    // A holding row has no date: it's unchanged throughout the filing.
+    const date = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/i)?.[1]?.trim().slice(0, 10) || null;
+    const grant = `${ownershipBucketKey(securityTitle, directOrIndirect, natureOfOwnership)}|${strike}|${expiry}`;
+    if (!grants.has(grant)) grants.set(grant, { underlying, rows: [] });
+    grants.get(grant).rows.push({ date, balance: sharesOwnedAfter });
+  }
+  return (underlyingTitle, onDate) => {
+    let total = null;
+    for (const { underlying, rows } of grants.values()) {
+      if (underlying !== underlyingTitle) continue;
+      // Last row on or before the date; a grant first touched later still
+      // held its pre-transaction balance then, unknown here, so it's left out.
+      let balance = null;
+      for (const r of rows) if (!r.date || r.date <= onDate) balance = r.balance;
+      if (balance != null) total = (total || 0) + balance;
+    }
+    return total;
+  };
+}
+
 // Real SEC Form 4 filings mix casing for the exact same field across
 // different filers/filing agents -- verified live: "HOLTUG LARS" and
 // "Imperiale Richard P" side by side in the same dataset, same field,
@@ -186,6 +226,7 @@ function parseForm4(xml) {
   const blocks = xml.match(/<nonDerivativeTransaction>[\s\S]*?<\/nonDerivativeTransaction>/gi) || [];
   const holdingBlocks = xml.match(/<nonDerivativeHolding>[\s\S]*?<\/nonDerivativeHolding>/gi) || [];
   const { bucketFinalBalance, totalBySecurity } = resolveOwnershipBuckets(blocks, holdingBlocks);
+  const derivativesBySecurity = resolveDerivativeHoldings(xml); // (securityTitle, date) -> total
   // Earliest exercise/conversion INTO each security in this filing (codes
   // M option exercise, C conversion, X in-the-money exercise). A sale on or
   // after it sells shares the exercise just created, so "% of stake" would
@@ -308,6 +349,10 @@ function parseForm4(xml) {
       // reduction of the pre-exercise holdings (null when there were none);
       // the app labels these "Exercise & sale".
       exerciseAndSale,
+      // Options/units convertible into this security still held after the
+      // filing (see resolveDerivativeHoldings); null when the filing lists
+      // none, which doesn't prove there are none.
+      derivativesOwnedAfter: derivativesBySecurity(securityTitle, transactionDate.slice(0, 10)),
     });
   }
   if (!transactions.length) return null;
